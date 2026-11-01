@@ -247,30 +247,111 @@ def summarize_holder_accounts(accounts: list[dict]) -> dict:
     }
 
 
+def transaction_mentions_mint(tx_record: dict, mint: str) -> bool:
+    """Check parsed pre/post token balances and parsed instruction info for a mint."""
+    meta = tx_record.get("meta") or {}
+    for field in ("preTokenBalances", "postTokenBalances"):
+        for item in meta.get(field) or []:
+            if item.get("mint") == mint:
+                return True
+
+    transaction = tx_record.get("transaction") or {}
+    message = transaction.get("message") or {}
+    instruction_groups = [
+        message.get("instructions") or [],
+        *[
+            group.get("instructions") or []
+            for group in (meta.get("innerInstructions") or [])
+        ],
+    ]
+    for instructions in instruction_groups:
+        for instruction in instructions:
+            parsed = instruction.get("parsed")
+            if isinstance(parsed, dict):
+                info = parsed.get("info") or {}
+                if info.get("mint") == mint:
+                    return True
+    return False
+
+
 async def helius_wallet_transactions(
     address: str,
     limit: int = 25,
     sort_order: str = "asc",
     mint_filter: str | None = None,
+    max_pages: int = 1,
 ) -> dict:
-    filters = {"status": "succeeded", "tokenAccounts": "all"}
-    if mint_filter:
-        filters["tokenTransfer"] = {"mint": mint_filter, "direction": "in"}
+    """
+    Fetch Helius full transaction history.
 
-    options = {
-        "transactionDetails": "full",
-        "sortOrder": sort_order,
-        "limit": max(1, min(int(limit), 100)),
-        "filters": filters,
-        "maxSupportedTransactionVersion": 0,
-    }
-    response = await helius_rpc("getTransactionsForAddress", [address, options])
-    if response.get("error"):
-        return response
-    result = response["result"]
+    Important: Helius rejects combining tokenTransfer with tokenAccounts='all'.
+    This implementation requests wallet + token-account history with tokenAccounts='all'
+    and, when a mint is requested, filters the returned full transactions locally.
+    """
+    limit = max(1, min(int(limit), 100))
+    max_pages = max(1, min(int(max_pages), 10))
+    all_transactions = []
+    matching_transactions = []
+    pagination_token = None
+    pages_read = 0
+
+    for _ in range(max_pages):
+        filters = {"status": "succeeded", "tokenAccounts": "all"}
+        options = {
+            "transactionDetails": "full",
+            "sortOrder": sort_order,
+            "limit": limit,
+            "filters": filters,
+            "maxSupportedTransactionVersion": 0,
+        }
+        if pagination_token:
+            options["paginationToken"] = pagination_token
+
+        response = await helius_rpc(
+            "getTransactionsForAddress", [address, options]
+        )
+        if response.get("error"):
+            return {
+                **response,
+                "data": matching_transactions if mint_filter else all_transactions,
+                "pages_read": pages_read,
+                "raw_transactions_scanned": len(all_transactions),
+            }
+
+        result = response["result"]
+        batch = result.get("data") or []
+        pages_read += 1
+        all_transactions.extend(batch)
+
+        if mint_filter:
+            matching = [
+                tx for tx in batch
+                if transaction_mentions_mint(tx, mint_filter)
+            ]
+            matching_transactions.extend(matching)
+            # Ascending order: the first page with the mint contains its earliest
+            # observed occurrence within the scanned history window.
+            if matching:
+                pagination_token = result.get("paginationToken")
+                break
+        else:
+            matching_transactions.extend(batch)
+
+        pagination_token = result.get("paginationToken")
+        if not pagination_token or not batch:
+            break
+
     return {
-        "data": result.get("data") or [],
-        "pagination_token": result.get("paginationToken"),
+        "data": matching_transactions if mint_filter else all_transactions,
+        "pagination_token": pagination_token,
+        "pages_read": pages_read,
+        "raw_transactions_scanned": len(all_transactions),
+        "mint_filter_mode": (
+            "client_side_filter_after_tokenAccounts_all"
+            if mint_filter else "not_applied"
+        ),
+        "mint_filter_matches": len(matching_transactions) if mint_filter else None,
+        "history_scan_complete": not bool(pagination_token),
     }
 
 
@@ -393,7 +474,7 @@ def extract_incoming_sol_transfers(tx_record: dict, wallet: str) -> list[dict]:
 async def scan_one_holder(owner: str, mint: str, amount_raw: int, semaphore: asyncio.Semaphore) -> dict:
     async with semaphore:
         token_history = await helius_wallet_transactions(
-            owner, limit=25, sort_order="asc", mint_filter=mint
+            owner, limit=100, sort_order="asc", mint_filter=mint, max_pages=5
         )
     if token_history.get("error"):
         return {
@@ -444,7 +525,11 @@ async def scan_one_holder(owner: str, mint: str, amount_raw: int, semaphore: asy
         "raw_amount": amount_raw,
         "first_inbound_token_transaction": first_buy,
         "funding_sources": funders[:5],
-        "token_history_transactions_returned": len(txs),
+        "token_history_matching_transactions_returned": len(txs),
+        "token_history_raw_transactions_scanned": token_history.get("raw_transactions_scanned"),
+        "token_history_pages_read": token_history.get("pages_read"),
+        "token_history_scan_complete": token_history.get("history_scan_complete"),
+        "token_history_filter_mode": token_history.get("mint_filter_mode"),
         "funding_history_transactions_returned": len(funding_history.get("data") or []),
         "funding_history_error": funding_history.get("error"),
     }
@@ -660,6 +745,7 @@ async def get_helius_wallet_transaction_history(
         limit=limit,
         sort_order=sort_order,
         mint_filter=token_mint_filter or None,
+        max_pages=3,
     )
     return {
         "source": "Helius getTransactionsForAddress",
@@ -725,6 +811,8 @@ async def analyze_solana_token_wallet_clusters(
         "cluster_candidates": clusters,
         "limitations": [
             "This is a bounded sample of the largest holders, not every holder.",
+            "Token-mint filtering is performed locally after fetching full wallet/token-account history; up to five pages of 100 transactions are sampled per wallet.",
+            "If no token-mint transaction appears in the bounded history sample, that is inconclusive and not proof the wallet never acquired the token.",
             "First observed incoming token transfer may be a transfer, not a DEX purchase.",
             "Same-slot activity is only a timing signal; it does not prove a Jito bundle.",
             "Shared SOL funders may be exchanges, custodians, relayers, launchpad services or other common infrastructure.",
