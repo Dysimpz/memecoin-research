@@ -860,11 +860,11 @@ async def analyze_solana_memecoin(token_address: str, max_wallets: int = 15) -> 
 
     max_wallets = max(3, min(int(max_wallets), 20))
     market, paid_orders, rugcheck_report, insider_graph, wallet_analysis = await asyncio.gather(
-        get_solana_token_market_data(token_address),
-        get_solana_token_paid_orders(token_address),
-        get_rugcheck_token_report(token_address),
-        get_rugcheck_insider_graph(token_address),
-        analyze_solana_token_wallet_clusters(token_address, max_wallets=max_wallets, max_pages=5),
+        get_solana_token_market_data.fn(token_address),
+        get_solana_token_paid_orders.fn(token_address),
+        get_rugcheck_token_report.fn(token_address),
+        get_rugcheck_insider_graph.fn(token_address),
+        analyze_solana_token_wallet_clusters.fn(token_address, max_wallets=max_wallets, max_pages=5),
         return_exceptions=True,
     )
 
